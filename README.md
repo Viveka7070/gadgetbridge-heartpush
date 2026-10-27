@@ -17,7 +17,7 @@
 - 数据链路：**手环 →(蓝牙)→ 手机上改过的 Gadgetbridge →(HTTPS)→ 你的后端 → 塞进你和 AI 的每一条消息**
 - 不是 MCP：AI 不用调用任何工具去查，数据由后端直接写进对话里
 - 你要做的三件事：
-    1. 用附件 `heart-push.patch` 编译改版 Gadgetbridge（或用[发布页](https://github.com/viveka7070/gadgetbridge-heartpush/releases/latest)现成的 APK）
+    1. 用附件 `heart-push.patch` 编译改版 Gadgetbridge（或用[现成的 APK](https://github.com/Viveka7070/gadgetbridge-heartpush/raw/main/gadgetbridge-heartpush.apk)）
     2. 后端加两个接口 `POST /hr`、`POST /daily`（附件 `server-example.js` 是可运行的最小示例，`heart.js` / `daily.js` 是纯逻辑，带完整注释）
     3. 把后端算出来的「心率行」「睡眠行」拼进每轮对话（见第七步）
 - **一定先读第十二节「踩过的坑」**，里面每一条都是实测花了时间才找到的
@@ -122,9 +122,9 @@
 
 ## 六、第二步：装改版 Gadgetbridge
 
-### 方式 A：用现成的 APK（本仓库发布页）
+### 方式 A：用现成的 APK（本仓库里的 gadgetbridge-heartpush.apk，第 8 版）
 
-到[发布页](https://github.com/viveka7070/gadgetbridge-heartpush/releases/latest)下载 `gadgetbridge-heartpush.apk` 直接安装。它就是用本教程附件 `heart-push.patch` 编出来的，里面**不含任何人的地址和钥匙**（地址和钥匙装好后你自己填）。
+[点这里下载](https://github.com/Viveka7070/gadgetbridge-heartpush/raw/main/gadgetbridge-heartpush.apk) `gadgetbridge-heartpush.apk` 直接安装。它就是用本教程附件 `heart-push.patch` 编出来的，里面**不含任何人的地址和钥匙**（地址和钥匙装好后你自己填）。
 
 - 安卓提示「来源未知」→ 允许
 - 这是**每夜编译版（nightly）**，包名 `nodomain.freeyourgadget.gadgetbridge.nightly`，桌面名字叫「Gadgetbridge (每夜编译版本)」，可以和 F-Droid 原版同时装着（但**同一时间只能有一个连手环**）
@@ -324,4 +324,4 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 | `heart.js` | 开发助手 | 心率逻辑：过滤、摘要、心率行、冲高判断 |
 | `daily.js` | 开发助手 | 睡眠逻辑：睡眠行、昨天全天行、只给一次 |
 | `server-example.js` | 开发助手 | 可运行的最小后端示例（Express） |
-| `gadgetbridge-heartpush.apk` | 你 | 用上面补丁编好的 App（在发布页下载，不在仓库文件里） |
+| `gadgetbridge-heartpush.apk` | 你 | 用上面补丁编好的 App（就在仓库里，第 8 版） |
