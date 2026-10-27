@@ -5,7 +5,7 @@
 //
 // 手机上的改版 Gadgetbridge 会:
 //   POST /hr     每 ~3 秒一批实时心率   {"samples":[{"t":毫秒,"hr":72,"steps":0,"total":3458}, ...]}
-//   POST /daily  每次和手环同步完一份   {"t":毫秒,"sleep":[...],"stages":[...],"days":[...]}
+//   POST /daily  每次和手环同步完一份   {"t":毫秒,"sleep":[...],"stages":[...],"mins":[...],"days":[...]}
 // 都带 Authorization: Bearer <HR_TOKEN>
 //
 // 这里只演示「收数据 → 算出要塞进对话的那几行」。怎么把这几行拼进你的 AI 对话,
@@ -50,7 +50,7 @@ try { sentWake = JSON.parse(fs.readFileSync(SENT_FILE, "utf8")).wake || sentWake
 app.post("/daily", (req, res) => {
   if (!authed(req)) return res.status(401).json({ ok: false });
   const b = req.body || {};
-  daily = { t: Date.now(), sleep: b.sleep || [], stages: b.stages || [], days: b.days || [] };
+  daily = { t: Date.now(), sleep: b.sleep || [], stages: b.stages || [], mins: b.mins || [], days: b.days || [] };
   fs.writeFileSync(DAILY_FILE, JSON.stringify(daily));
   res.json({ ok: true });
 });

@@ -227,10 +227,10 @@ index 2758594..e061e60 100644
      /**
 diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java
 new file mode 100644
-index 0000000..be4ebc5
+index 0000000..61afa3b
 --- /dev/null
 +++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,232 @@
 +/*  push realtime heart rate samples to a user-configured server.
 +
 +    Gadgetbridge is free software: you can redistribute it and/or modify
@@ -436,12 +436,23 @@ index 0000000..be4ebc5
 +        final String stages = q(db,
 +                "SELECT TIMESTAMP AS t, STAGE AS st FROM XIAOMI_SLEEP_STAGE_SAMPLE WHERE TIMESTAMP > ? ORDER BY TIMESTAMP",
 +                String.valueOf(nowMs - 48 * 3600_000L));
++        // 睡眠期间每分钟的心率/血氧(秒级时间戳)。回笼觉被并进同一晚后,服务器按分段各算各的心率和血氧
++        final String inSleep = " EXISTS (SELECT 1 FROM XIAOMI_SLEEP_TIME_SAMPLE s WHERE s.WAKEUP_TIME > ?";
++        final String mins = q(db,
++                "SELECT a.TIMESTAMP AS t, CASE WHEN a.HEART_RATE BETWEEN 30 AND 220 THEN a.HEART_RATE END AS hr,"
++                        + " CASE WHEN a.SPO2 BETWEEN 70 AND 100 THEN a.SPO2 END AS o FROM XIAOMI_ACTIVITY_SAMPLE a"
++                        + " WHERE (a.HEART_RATE BETWEEN 30 AND 220 OR a.SPO2 BETWEEN 70 AND 100) AND" + inSleep
++                        + " AND a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000)"
++                        + " UNION ALL SELECT m.TIMESTAMP/1000 AS t, NULL AS hr, m.VALUE AS o FROM XIAOMI_MANUAL_SAMPLE m"
++                        + " WHERE m.TYPE = 18 AND m.VALUE BETWEEN 70 AND 100 AND" + inSleep
++                        + " AND m.TIMESTAMP BETWEEN s.TIMESTAMP AND s.WAKEUP_TIME) ORDER BY t",
++                since, since);
 +        final String days = q(db,
 +                "SELECT TIMESTAMP AS day, STEPS AS steps, HR_RESTING AS hr_resting, HR_AVG AS hr_avg,"
 +                        + " HR_MIN AS hr_min, HR_MAX AS hr_max, STRESS_AVG AS stress_avg, STRESS_MAX AS stress_max,"
 +                        + " SPO2_AVG AS spo2_avg, SPO2_MIN AS spo2_min, CALORIES AS calories"
 +                        + " FROM XIAOMI_DAILY_SUMMARY_SAMPLE ORDER BY TIMESTAMP DESC LIMIT 2");
-+        return "{\"t\":" + nowMs + ",\"sleep\":" + sleep + ",\"stages\":" + stages + ",\"days\":" + days + "}";
++        return "{\"t\":" + nowMs + ",\"sleep\":" + sleep + ",\"stages\":" + stages + ",\"mins\":" + mins + ",\"days\":" + days + "}";
 +    }
 +
 +    private static void logThrottled(final String what) {

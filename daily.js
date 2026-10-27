@@ -57,7 +57,18 @@ export function sleepParts(s, stages) {
 
 const stageText = (p) => `深睡${dur(p.deep)} 浅睡${dur(p.light)} REM ${dur(p.rem)}` + (Math.round(p.awake) ? ` · 中间醒着${dur(p.awake)}` : "");
 
-function sleepLine(s, stages) {
+// 这一段里手环记的心率/血氧(mins 是 App 第 8 版起送的睡眠期间每分钟数据,t 是秒)
+const vitalsText = (mins, from, to) => {
+  const xs = (Array.isArray(mins) ? mins : []).filter((m) => m.t * 1000 >= from && m.t * 1000 <= to);
+  const hr = xs.map((m) => num(m.hr)).filter((v) => v != null), o = xs.map((m) => num(m.o)).filter((v) => v != null);
+  const avg = (a) => Math.round(a.reduce((x, y) => x + y, 0) / a.length);
+  let t = "";
+  if (hr.length) t += ` · 心率 ${Math.min(...hr)}~${Math.max(...hr)},平均${avg(hr)}`;
+  if (o.length) t += ` · 血氧平均${avg(o)}、最低${Math.min(...o)}`;
+  return t;
+};
+
+function sleepLine(s, stages, mins) {
   const main = (s.total || 0) >= 180;                          // 3 小时以上算正经睡,以下算小睡/回笼觉
   const parts = sleepParts(s, stages).filter((p) => p.total >= 10);
   let t = `【${main ? "睡眠" : "小睡"} ${hm(s.start)}–${hm(s.wake)} · 睡着${dur(s.total)}`;
@@ -73,9 +84,12 @@ function sleepLine(s, stages) {
   }
   t += "】";
   if (parts.length >= 2) {
-    const seg = parts.map((p, i) => `${i === 0 ? (main ? "夜里" : "第1段") : main ? "回笼觉" : `第${i + 1}段`} ${hm(p.start)}–${hm(p.end)} 睡着${dur(p.total)}(${stageText(p)})`
-      + (i + 1 < parts.length ? `;醒了${dur((parts[i + 1].start - p.end) / 60e3)};` : ""));
-    t += `\n【分段 · ${seg.join("")}】`;
+    // 合并的那行留着,下面每段单独一行,各带各的分期、心率、血氧
+    parts.forEach((p, i) => {
+      const name = main ? (i === 0 ? "夜里" : "回笼觉") : `第${i + 1}段`;
+      const gap = i ? ` · 前面醒了${dur((p.start - parts[i - 1].end) / 60e3)}` : "";
+      t += `\n【分段${"①②③④⑤⑥"[i] || i + 1} ${name} ${hm(p.start)}–${hm(p.end)}${gap} · 睡着${dur(p.total)}(${stageText(p)})${vitalsText(mins, p.start, p.end)}】`;
+    });
   }
   return t;
 }
@@ -94,7 +108,7 @@ function dayLine(d, label) {
 export function dailyBlock(daily, { now = Date.now(), sentWake = 0 } = {}) {
   const pend = pendingSleep(daily, { now, sentWake });
   if (!pend.length) return { text: "", wake: sentWake };
-  const lines = pend.map((s) => sleepLine(s, daily.stages));
+  const lines = pend.map((s) => sleepLine(s, daily.stages, daily.mins));
   // 有正经睡的那段,才顺带给「昨天全天」—— 小睡/午睡不重复报
   if (pend.some((s) => (s.total || 0) >= 180)) {
     const yday = bjDay(now - 86400e3);
