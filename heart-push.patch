@@ -1,0 +1,508 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index a39f06e..648150c 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -56,8 +56,8 @@
+     <uses-permission android:name="nz.eloque.foss_wallet.READ_CARDS"/>
+     <uses-permission android:name="nz.eloque.foss_wallet.dev.READ_CARDS"/>
+ 
+-    <!-- Make sure we don't get the INTERNET permission even when a dependency requires it -->
+-    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
++    <!-- 注意:心率实时推送要联网(只发心率到你自己的服务器)。上游刻意移除了这个权限。 -->
++    <uses-permission android:name="android.permission.INTERNET" />
+ 
+     <!-- Internet Helper -->
+     <uses-permission android:name="nodomain.freeyourgadget.internethelper.INTERNET"/>
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/NewDataReceiver.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/NewDataReceiver.java
+index 169c4bb..e4f23d2 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/NewDataReceiver.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/externalevents/NewDataReceiver.java
+@@ -41,6 +41,7 @@ import nodomain.freeyourgadget.gadgetbridge.GBApplication;
+ import nodomain.freeyourgadget.gadgetbridge.activities.workouts.WorkoutUploadWorker;
+ import nodomain.freeyourgadget.gadgetbridge.impl.GBDevice;
+ import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs;
++import nodomain.freeyourgadget.gadgetbridge.util.HeartPusher;
+ import nodomain.freeyourgadget.gadgetbridge.util.healthconnect.HealthConnectSyncWorker;
+ 
+ public class NewDataReceiver extends BroadcastReceiver {
+@@ -81,6 +82,10 @@ public class NewDataReceiver extends BroadcastReceiver {
+     public void onReceive(Context context, Intent intent) {
+         GBPrefs prefs = GBApplication.getPrefs();
+         maybeScheduleAutoUpload(context, intent, prefs);
++        // 同步完把睡眠和日汇总推给你的服务器(自带防抖,没开推送就什么都不做)
++        if (ACTION_NEW_DATA.equals(intent.getAction())) {
++            HeartPusher.scheduleDaily();
++        }
+         if (ACTION_NEW_DATA.equals(intent.getAction()) &&
+                 prefs.getBoolean(GBPrefs.HEALTH_CONNECT_ENABLED, false) &&
+                 prefs.getBoolean(GBPrefs.HEALTH_CONNECT_SYNC_ON_EVENT, false)) {
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/xiaomi/services/XiaomiHealthService.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/xiaomi/services/XiaomiHealthService.java
+index 2758594..e061e60 100644
+--- a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/xiaomi/services/XiaomiHealthService.java
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/devices/xiaomi/services/XiaomiHealthService.java
+@@ -16,11 +16,17 @@
+     along with this program.  If not, see <https://www.gnu.org/licenses/>. */
+ package nodomain.freeyourgadget.gadgetbridge.service.devices.xiaomi.services;
+ 
++import android.app.AlarmManager;
++import android.app.PendingIntent;
++import android.content.BroadcastReceiver;
++import android.content.Context;
+ import android.content.Intent;
++import android.content.IntentFilter;
+ import android.location.Location;
+ import android.os.Handler;
+ import android.os.SystemClock;
+ 
++import androidx.core.content.ContextCompat;
+ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+ 
+ import com.google.protobuf.ByteString;
+@@ -91,6 +97,7 @@ import nodomain.freeyourgadget.gadgetbridge.service.devices.xiaomi.XiaomiSupport
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.xiaomi.activity.XiaomiActivityFileFetcher;
+ import nodomain.freeyourgadget.gadgetbridge.service.devices.xiaomi.activity.XiaomiActivityFileId;
+ import nodomain.freeyourgadget.gadgetbridge.util.GB;
++import nodomain.freeyourgadget.gadgetbridge.util.HeartPusher;
+ import nodomain.freeyourgadget.gadgetbridge.util.Prefs;
+ 
+ public class XiaomiHealthService extends AbstractXiaomiService {
+@@ -161,6 +168,89 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+         SLEEP_AS_ANDROID,
+         /** A single heart rate measurement, released as soon as a reading arrives. */
+         ONE_SHOT,
++        /** keep the stream on in the background and push every reading to a server. */
++        REMOTE,
++    }
++
++    /** if the stream goes quiet for this long while REMOTE is on, ask the band again. */
++    private static final long REMOTE_WATCHDOG_MS = 20_000;
++    private final Handler remoteWatchdog = new Handler();
++    private long lastRealtimeAt = 0;
++    private final Runnable remoteWatchdogTick = new Runnable() {
++        @Override
++        public void run() {
++            final boolean remoteOn;
++            synchronized (realtimeConsumers) {
++                remoteOn = realtimeConsumers.contains(RealtimeConsumer.REMOTE);
++            }
++            if (!remoteOn) {
++                return;
++            }
++            if (SystemClock.elapsedRealtime() - lastRealtimeAt > REMOTE_WATCHDOG_MS) {
++                LOG.debug("Realtime stream quiet, restarting for remote push");
++                sendRealtimeStats(true);
++            }
++            remoteWatchdog.postDelayed(this, REMOTE_WATCHDOG_MS);
++        }
++    };
++
++    /*
++     * 手机熄屏一个多小时后进入深度休眠(Doze),上面那个 Handler 也会被冻住 ——
++     * 实时流一停就没人去重开,心率要断到早上动手机(2026-10-11~16 每晚 1:40 前后断到六七点,
++     * 中间只在系统维护窗口冒出十几分钟)。补一个「休眠里也允许响」的闹钟:
++     * 醒着时 5 分钟一次;休眠里系统会把它拉长到大约 9~15 分钟一次,这是安卓允许的上限。
++     */
++    private static final String ACTION_REMOTE_ALARM = "nodomain.freeyourgadget.gadgetbridge.HEARTPUSH_WATCHDOG";
++    private static final long REMOTE_ALARM_MS = 5 * 60_000;
++    private BroadcastReceiver remoteAlarmReceiver;
++    private PendingIntent remoteAlarmIntent(final Context ctx) {
++        final Intent i = new Intent(ACTION_REMOTE_ALARM).setPackage(ctx.getPackageName());
++        return PendingIntent.getBroadcast(ctx, 0x5e1, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
++    }
++
++    private void armRemoteAlarm() {
++        final Context ctx = getSupport().getContext();
++        final AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
++        if (am == null) return;
++        am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
++                SystemClock.elapsedRealtime() + REMOTE_ALARM_MS, remoteAlarmIntent(ctx));
++    }
++
++    private void startRemoteAlarm() {
++        final Context ctx = getSupport().getContext();
++        if (remoteAlarmReceiver == null) {
++            remoteAlarmReceiver = new BroadcastReceiver() {
++                @Override
++                public void onReceive(final Context context, final Intent intent) {
++                    final boolean remoteOn;
++                    synchronized (realtimeConsumers) {
++                        remoteOn = realtimeConsumers.contains(RealtimeConsumer.REMOTE);
++                    }
++                    if (!remoteOn) return;
++                    if (SystemClock.elapsedRealtime() - lastRealtimeAt > REMOTE_WATCHDOG_MS) {
++                        LOG.info("Realtime stream quiet (alarm), restarting for remote push");
++                        sendRealtimeStats(true);
++                    }
++                    armRemoteAlarm();
++                }
++            };
++            ContextCompat.registerReceiver(ctx, remoteAlarmReceiver, new IntentFilter(ACTION_REMOTE_ALARM),
++                    ContextCompat.RECEIVER_NOT_EXPORTED);
++        }
++        armRemoteAlarm();
++    }
++
++    private void stopRemoteAlarm() {
++        final Context ctx = getSupport().getContext();
++        final AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
++        if (am != null) am.cancel(remoteAlarmIntent(ctx));
++        if (remoteAlarmReceiver != null) {
++            try {
++                ctx.unregisterReceiver(remoteAlarmReceiver);
++            } catch (final Exception ignored) {
++            }
++            remoteAlarmReceiver = null;
++        }
+     }
+ 
+     private static final int WORKOUT_STARTED = 0;
+@@ -296,11 +386,21 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+         getSupport().sendCommand("get goal notification config", COMMAND_TYPE, CMD_CONFIG_GOAL_NOTIFICATION_GET);
+         getSupport().sendCommand("get goals config", COMMAND_TYPE, CMD_CONFIG_GOALS_GET);
+         getSupport().sendCommand("get vitality score config", COMMAND_TYPE, CMD_CONFIG_VITALITY_SCORE_GET);
++
++        if (HeartPusher.isEnabled()) {
++            lastRealtimeAt = SystemClock.elapsedRealtime();
++            setRealtimeConsumer(RealtimeConsumer.REMOTE, true);
++            remoteWatchdog.removeCallbacksAndMessages(null);
++            remoteWatchdog.postDelayed(remoteWatchdogTick, REMOTE_WATCHDOG_MS);
++            startRemoteAlarm();
++        }
+     }
+ 
+     @Override
+     public void dispose() {
+         gpsTimeoutHandler.removeCallbacksAndMessages(null);
++        remoteWatchdog.removeCallbacksAndMessages(null);
++        stopRemoteAlarm();
+         gpsStarted = false;
+         gpsFixAcquired = false;
+         workoutStarted = false;
+@@ -547,7 +647,8 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+                 // only all-day maps to the on/off preference in Gadgetbridge.
+                 // Sleep-only is valid on the wire but is not shown in the on-watch
+                 // UI nor in the vendor app UI of Mi Band 10, so it reads as off here.
+-                .withPreference(DeviceSettingsPreferenceConst.PREF_SPO2_ALL_DAY_MONITORING, spo2.getMode() == Spo2Mode.SPO2_MODE_ALL_DAY)
++                // 注意: 读回来「仅睡眠」也算开(防止开关被翻回去),见 setSpo2Config。
++                .withPreference(DeviceSettingsPreferenceConst.PREF_SPO2_ALL_DAY_MONITORING, spo2.getMode() != Spo2Mode.SPO2_MODE_OFF)
+                 .withPreference(
+                         DeviceSettingsPreferenceConst.PREF_SPO2_LOW_ALERT_THRESHOLD,
+                         String.valueOf(spo2.getAlarmLow().getAlarmLowEnabled() ? spo2.getAlarmLow().getAlarmLowThreshold() : 0)
+@@ -563,11 +664,16 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+         final boolean allDayMonitoring = prefs.getBoolean(DeviceSettingsPreferenceConst.PREF_SPO2_ALL_DAY_MONITORING, false);
+         final int lowAlertThreshold = prefs.getInt(DeviceSettingsPreferenceConst.PREF_SPO2_LOW_ALERT_THRESHOLD, 0);
+ 
++        // 注意: 照抄小米运动健康发给手环 10 的原始字节(Gadgetbridge issue #5626 里有人抓的包):
++        //   08081009 520c 3a0a 0801 1002 2204 0801 105a  = unknown1=1, mode=2(全天), 报警开、阈值 90
++        // 开全天时报警一律带上「开、90」(没设阈值就用 90),跟官方一字不差。
++        // 之前猜过「仅睡眠」(第 5 版)、「全天+报警关」(第 6 版),手环都回 ack 但不生效。
++        final int threshold = allDayMonitoring ? (lowAlertThreshold != 0 ? lowAlertThreshold : 90) : lowAlertThreshold;
+         final var spo2alarmLowBuilder = Spo2AlarmLow.newBuilder()
+-                .setAlarmLowEnabled(lowAlertThreshold != 0);
++                .setAlarmLowEnabled(threshold != 0);
+ 
+-        if (lowAlertThreshold != 0) {
+-            spo2alarmLowBuilder.setAlarmLowThreshold(lowAlertThreshold);
++        if (threshold != 0) {
++            spo2alarmLowBuilder.setAlarmLowThreshold(threshold);
+         }
+ 
+         final var spo2 = SpO2.newBuilder()
+@@ -1050,6 +1156,7 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+ 
+     private void handleRealtimeStats(final RealTimeStats realTimeStats) {
+         LOG.debug("Got realtime stats");
++        lastRealtimeAt = SystemClock.elapsedRealtime();
+ 
+         final boolean noConsumers;
+         final boolean oneShot;
+@@ -1112,6 +1219,8 @@ public class XiaomiHealthService extends AbstractXiaomiService {
+         if (sleepAsAndroidSender != null && realTimeStats.getHeartRate() > 0) {
+             sleepAsAndroidSender.onHrChanged(realTimeStats.getHeartRate(), 0);
+         }
++
++        HeartPusher.push(realTimeStats.getHeartRate(), sample.getSteps(), realTimeStats.getSteps(), sample.getTimestamp() * 1000L);
+     }
+ 
+     /**
+diff --git a/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java
+new file mode 100644
+index 0000000..be4ebc5
+--- /dev/null
++++ b/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/util/HeartPusher.java
+@@ -0,0 +1,221 @@
++/*  push realtime heart rate samples to a user-configured server.
++
++    Gadgetbridge is free software: you can redistribute it and/or modify
++    it under the terms of the GNU Affero General Public License as published
++    by the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version. */
++package nodomain.freeyourgadget.gadgetbridge.util;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.OutputStream;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
++
++import android.database.Cursor;
++import android.database.sqlite.SQLiteDatabase;
++
++import nodomain.freeyourgadget.gadgetbridge.database.DBHandler;
++
++import nodomain.freeyourgadget.gadgetbridge.GBApplication;
++
++/**
++ * 把手环的实时心率读数送到你自己的服务器(POST /hr)。
++ * <p>
++ * - 读数先进一个内存队列,由单线程发出去,蓝牙线程不等网络。
++ * - 发失败(没网、服务器在重新部署)就留在队列里,下一次一起补发,最多留 MAX_PENDING 条。
++ * - 每次最多发 MAX_BATCH 条,断网很久之后也不会一次塞一个巨大的请求。
++ */
++public final class HeartPusher {
++    private static final Logger LOG = LoggerFactory.getLogger(HeartPusher.class);
++
++    public static final String PREF_ENABLED = "heart_push_enabled";
++    public static final String PREF_URL = "heart_push_url";
++    public static final String PREF_TOKEN = "heart_push_token";
++
++    private static final int MAX_PENDING = 7200;   // 每秒一个 ≈ 2 小时
++    private static final int MAX_BATCH = 600;
++
++    private static final ScheduledExecutorService EXEC = Executors.newSingleThreadScheduledExecutor();
++    private static ScheduledFuture<?> pendingDaily;
++    private static final ArrayDeque<String> PENDING = new ArrayDeque<>();
++    private static long lastErrorLogAt = 0;
++
++    private HeartPusher() {
++    }
++
++    public static boolean isEnabled() {
++        final Prefs prefs = GBApplication.getPrefs();
++        return prefs.getBoolean(PREF_ENABLED, false) && !url().isEmpty();
++    }
++
++    private static String url() {
++        return GBApplication.getPrefs().getString(PREF_URL, "").trim();
++    }
++
++    private static String token() {
++        return GBApplication.getPrefs().getString(PREF_TOKEN, "").trim();
++    }
++
++    /**
++     * @param steps      这一个读数和上一个之间多走的步数
++     * @param totalSteps 手环自己的「今天累计步数」(计步器攒一阵才跳一次,不是一步一报)
++     */
++    public static void push(final int heartRate, final int steps, final int totalSteps, final long timestampMs) {
++        if (heartRate <= 0 || !isEnabled()) {
++            return;
++        }
++        synchronized (PENDING) {
++            PENDING.add("{\"t\":" + timestampMs + ",\"hr\":" + heartRate + ",\"steps\":" + Math.max(0, steps)
++                    + ",\"total\":" + Math.max(0, totalSteps) + "}");
++            while (PENDING.size() > MAX_PENDING) {
++                PENDING.poll();
++            }
++        }
++        EXEC.execute(HeartPusher::flush);
++    }
++
++    private static void flush() {
++        final List<String> batch = new ArrayList<>();
++        synchronized (PENDING) {
++            for (final String s : PENDING) {
++                if (batch.size() >= MAX_BATCH) break;
++                batch.add(s);
++            }
++        }
++        if (batch.isEmpty()) {
++            return;
++        }
++
++        final String body = "{\"samples\":[" + String.join(",", batch) + "]}";
++        if (post(url(), body)) {
++            synchronized (PENDING) {
++                // 只删发出去的那几条:发送期间新进来的读数还在队尾,不动
++                for (final String s : batch) {
++                    if (s.equals(PENDING.peek())) PENDING.poll();
++                    else break;
++                }
++            }
++        }
++    }
++
++    private static boolean post(final String target, final String body) {
++        HttpURLConnection conn = null;
++        try {
++            conn = (HttpURLConnection) new URL(target).openConnection();
++            conn.setConnectTimeout(8000);
++            conn.setReadTimeout(8000);
++            conn.setRequestMethod("POST");
++            conn.setDoOutput(true);
++            conn.setRequestProperty("Content-Type", "application/json");
++            conn.setRequestProperty("Authorization", "Bearer " + token());
++            try (OutputStream os = conn.getOutputStream()) {
++                os.write(body.getBytes(StandardCharsets.UTF_8));
++            }
++            final int code = conn.getResponseCode();
++            if (code >= 200 && code < 300) return true;
++            logThrottled("HTTP " + code);
++        } catch (final Exception e) {
++            logThrottled(e.getClass().getSimpleName() + ": " + e.getMessage());
++        } finally {
++            if (conn != null) conn.disconnect();
++        }
++        return false;
++    }
++
++    // ---- 每日摘要 -------------------------------------------------------------
++    // 手环同步完(ACTION_NEW_DATA)→ 等 20 秒(一次同步会连发好几个)→ 从数据库挑出
++    // 最近的睡眠、整夜心率/血氧、最近两天的日汇总,POST 到 .../daily。
++    // 发失败不重试:下一次同步会再发一份完整的,服务器按时间覆盖。
++
++    /** 和心率同一个服务器:把地址末尾的 /hr 换成 /daily */
++    static String dailyUrl(final String hrUrl) {
++        final String u = hrUrl.replaceAll("/+$", "");
++        return u.endsWith("/hr") ? u.substring(0, u.length() - 3) + "/daily" : u + "/daily";
++    }
++
++    public static synchronized void scheduleDaily() {
++        if (!isEnabled()) return;
++        if (pendingDaily != null) pendingDaily.cancel(false);
++        pendingDaily = EXEC.schedule(HeartPusher::sendDaily, 20, TimeUnit.SECONDS);
++    }
++
++    private static void sendDaily() {
++        final String body;
++        try (DBHandler db = GBApplication.acquireDB()) {
++            body = buildDaily(db.getDatabase(), System.currentTimeMillis());
++        } catch (final Exception e) {
++            LOG.warn("Daily summary build failed", e);
++            return;
++        }
++        if (post(dailyUrl(url()), body)) LOG.info("Daily summary pushed");
++    }
++
++    private static String q(final SQLiteDatabase db, final String sql, final String... args) {
++        try (Cursor c = db.rawQuery(sql, args)) {
++            if (!c.moveToFirst()) return "[]";
++            final StringBuilder sb = new StringBuilder("[");
++            do {
++                if (sb.length() > 1) sb.append(',');
++                sb.append('{');
++                for (int i = 0; i < c.getColumnCount(); i++) {
++                    if (i > 0) sb.append(',');
++                    sb.append('"').append(c.getColumnName(i).toLowerCase(Locale.ROOT)).append("\":");
++                    if (c.isNull(i)) sb.append("null");
++                    else if (c.getType(i) == Cursor.FIELD_TYPE_FLOAT) sb.append(Math.round(c.getDouble(i) * 10) / 10.0);
++                    else sb.append(c.getLong(i));
++                }
++                sb.append('}');
++            } while (c.moveToNext());
++            return sb.append(']').toString();
++        }
++    }
++
++    static String buildDaily(final SQLiteDatabase db, final long nowMs) {
++        final String since = String.valueOf(nowMs - 36 * 3600_000L);
++        // 每段睡眠顺带算出这段时间里手环自己记的心率和血氧(实时流夜里会断,这份不会)
++        final String sleep = q(db,
++                "SELECT s.TIMESTAMP AS start, s.WAKEUP_TIME AS wake, s.TOTAL_DURATION AS total,"
++                        + " s.DEEP_SLEEP_DURATION AS deep, s.LIGHT_SLEEP_DURATION AS light,"
++                        + " s.REM_SLEEP_DURATION AS rem, s.AWAKE_DURATION AS awake,"
++                        + " (SELECT MIN(a.HEART_RATE) FROM XIAOMI_ACTIVITY_SAMPLE a WHERE a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000 AND a.HEART_RATE BETWEEN 30 AND 220) AS hr_min,"
++                        + " (SELECT AVG(a.HEART_RATE) FROM XIAOMI_ACTIVITY_SAMPLE a WHERE a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000 AND a.HEART_RATE BETWEEN 30 AND 220) AS hr_avg,"
++                        + " (SELECT MAX(a.HEART_RATE) FROM XIAOMI_ACTIVITY_SAMPLE a WHERE a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000 AND a.HEART_RATE BETWEEN 30 AND 220) AS hr_max,"
++                        // 血氧两处都可能有:分钟数据里的 SPO2 列,和「手动/自动测量」表(TYPE 18 = 0x12)。两处并起来算
++                        + " (SELECT MIN(v) FROM (SELECT a.SPO2 AS v FROM XIAOMI_ACTIVITY_SAMPLE a WHERE a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000 AND a.SPO2 BETWEEN 70 AND 100"
++                        + "   UNION ALL SELECT m.VALUE FROM XIAOMI_MANUAL_SAMPLE m WHERE m.TYPE = 18 AND m.TIMESTAMP BETWEEN s.TIMESTAMP AND s.WAKEUP_TIME AND m.VALUE BETWEEN 70 AND 100)) AS spo2_min,"
++                        + " (SELECT AVG(v) FROM (SELECT a.SPO2 AS v FROM XIAOMI_ACTIVITY_SAMPLE a WHERE a.TIMESTAMP BETWEEN s.TIMESTAMP/1000 AND s.WAKEUP_TIME/1000 AND a.SPO2 BETWEEN 70 AND 100"
++                        + "   UNION ALL SELECT m.VALUE FROM XIAOMI_MANUAL_SAMPLE m WHERE m.TYPE = 18 AND m.TIMESTAMP BETWEEN s.TIMESTAMP AND s.WAKEUP_TIME AND m.VALUE BETWEEN 70 AND 100)) AS spo2_avg"
++                        + " FROM XIAOMI_SLEEP_TIME_SAMPLE s WHERE s.WAKEUP_TIME > ? ORDER BY s.TIMESTAMP",
++                since);
++        // 分期:每条是「从这一刻起换成某个阶段」(5 醒 3 浅 2 深 4 REM 0 不在睡)。
++        // 回笼觉会被手环并进同一晚、汇总被整段重算,服务器靠这份拆回「夜里」和「回笼」
++        final String stages = q(db,
++                "SELECT TIMESTAMP AS t, STAGE AS st FROM XIAOMI_SLEEP_STAGE_SAMPLE WHERE TIMESTAMP > ? ORDER BY TIMESTAMP",
++                String.valueOf(nowMs - 48 * 3600_000L));
++        final String days = q(db,
++                "SELECT TIMESTAMP AS day, STEPS AS steps, HR_RESTING AS hr_resting, HR_AVG AS hr_avg,"
++                        + " HR_MIN AS hr_min, HR_MAX AS hr_max, STRESS_AVG AS stress_avg, STRESS_MAX AS stress_max,"
++                        + " SPO2_AVG AS spo2_avg, SPO2_MIN AS spo2_min, CALORIES AS calories"
++                        + " FROM XIAOMI_DAILY_SUMMARY_SAMPLE ORDER BY TIMESTAMP DESC LIMIT 2");
++        return "{\"t\":" + nowMs + ",\"sleep\":" + sleep + ",\"stages\":" + stages + ",\"days\":" + days + "}";
++    }
++
++    private static void logThrottled(final String what) {
++        final long now = System.currentTimeMillis();
++        if (now - lastErrorLogAt > 60_000) {
++            lastErrorLogAt = now;
++            LOG.warn("Heart push failed ({}), {} samples pending", what, PENDING.size());
++        }
++    }
++}
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index f3004f2..e3b93be 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -314,6 +314,38 @@
+         android:key="pref_screen_external_integrations"
+         android:title="@string/pref_header_external_integrations">
+ 
++        <!-- 注意:把手环的实时心率持续送到你自己的服务器(/hr) -->
++        <PreferenceScreen
++            android:icon="@drawable/ic_heartrate"
++            android:key="heart_push_settings"
++            android:summary="开着时后台一直测心率,每个读数都发到下面的地址"
++            android:title="心率实时推送"
++            app:iconSpaceReserved="false">
++            <SwitchPreferenceCompat
++                android:defaultValue="false"
++                android:key="heart_push_enabled"
++                android:layout="@layout/preference_checkbox"
++                android:summary="会比平时费手环电"
++                android:title="开启心率实时推送"
++                app:iconSpaceReserved="false" />
++            <EditTextPreference
++                android:defaultValue=""
++                android:dependency="heart_push_enabled"
++                android:inputType="textUri"
++                android:key="heart_push_url"
++                android:title="服务器地址"
++                app:useSimpleSummaryProvider="true"
++                app:iconSpaceReserved="false" />
++            <EditTextPreference
++                android:defaultValue=""
++                android:dependency="heart_push_enabled"
++                android:inputType="textPassword"
++                android:key="heart_push_token"
++                android:summary="服务器给的钥匙"
++                android:title="钥匙"
++                app:iconSpaceReserved="false" />
++        </PreferenceScreen>
++
+         <PreferenceScreen
+             android:icon="@drawable/ic_navigation"
+             android:key="navigation_settings"
+diff --git a/app/src/nightly/res/values/strings.xml b/app/src/nightly/res/values/strings.xml
+index ccc5ea3..2462431 100644
+--- a/app/src/nightly/res/values/strings.xml
++++ b/app/src/nightly/res/values/strings.xml
+@@ -5,4 +5,6 @@
+     <string translatable="false" name="about_activity_title">@string/about_activity_title_main_nightly</string>
+     <string translatable="false" name="about_description">@string/about_description_main_nightly</string>
+     <string translatable="false" name="gadgetbridge_running">@string/gadgetbridge_running_main_nightly</string>
++    <!-- 注意:和 F-Droid 原版同时装时,两边的 Pebble 数据接口不能同名(安卓会判「软件包冲突」拒装) -->
++    <string translatable="false" name="pebble_content_provider">com.getpebble.android.nightly.heartpush.provider</string>
+ </resources>
