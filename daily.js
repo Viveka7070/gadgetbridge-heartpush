@@ -30,7 +30,9 @@ export function pendingSleep(daily, { now = Date.now(), sentWake = 0 } = {}) {
 // 把一段睡眠里的分期切成几段连续的睡:中间醒着/不在睡 ≥ SPLIT_MIN 分钟就断开。
 // 为什么要:她睡了回笼觉,手环会把回笼觉并进同一晚、整段重算(比如 02:33–06:52 变成 02:33–09:59),
 // 汇总里分不出哪段是夜里的。分期是一直在的,靠它拆回来。
-const SPLIT_MIN = 20;
+// 夜里起来上厕所醒十来分钟也要分开显示(那晚醒了 03:34–03:44 整 10 分钟,20 分钟的门槛没切)
+const SPLIT_MIN = 10;
+const bjHour = (ms) => new Date(ms + BJ).getUTCHours();
 const ASLEEP = new Set([2, 3, 4]);
 export function sleepParts(s, stages) {
   const pts = (Array.isArray(stages) ? stages : [])
@@ -69,7 +71,9 @@ const vitalsText = (mins, from, to) => {
 };
 
 function sleepLine(s, stages, mins) {
-  const main = (s.total || 0) >= 180;                          // 3 小时以上算正经睡,以下算小睡/回笼觉
+  // 3 小时以上,或者是晚上 8 点到早上 6 点之间睡下的,算正经睡;其余算小睡。
+  // 后半条是 10-28 加的:半夜醒了发消息时手环只同步到前半夜(01:23–03:34,2 小时出头),被错标成了「小睡」
+  const main = (s.total || 0) >= 180 || bjHour(s.start) >= 20 || bjHour(s.start) < 6;
   const parts = sleepParts(s, stages).filter((p) => p.total >= 10);
   let t = `【${main ? "睡眠" : "小睡"} ${hm(s.start)}–${hm(s.wake)} · 睡着${dur(s.total)}`;
   if (s.deep || s.light || s.rem) t += `(${stageText(s)})`;
@@ -86,7 +90,8 @@ function sleepLine(s, stages, mins) {
   if (parts.length >= 2) {
     // 合并的那行留着,下面每段单独一行,各带各的分期、心率、血氧
     parts.forEach((p, i) => {
-      const name = main ? (i === 0 ? "夜里" : "回笼觉") : `第${i + 1}段`;
+      // 早上 6 点后才又睡着的才叫回笼觉;半夜上个厕所回来接着睡的就叫第 2 段
+      const name = !main ? `第${i + 1}段` : i === 0 ? "夜里" : bjHour(p.start) >= 6 ? "回笼觉" : `第${i + 1}段`;
       const gap = i ? ` · 前面醒了${dur((p.start - parts[i - 1].end) / 60e3)}` : "";
       t += `\n【分段${"①②③④⑤⑥"[i] || i + 1} ${name} ${hm(p.start)}–${hm(p.end)}${gap} · 睡着${dur(p.total)}(${stageText(p)})${vitalsText(mins, p.start, p.end)}】`;
     });
