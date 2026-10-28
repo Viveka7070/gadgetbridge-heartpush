@@ -30,8 +30,9 @@ export function pendingSleep(daily, { now = Date.now(), sentWake = 0 } = {}) {
 // 把一段睡眠里的分期切成几段连续的睡:中间醒着/不在睡 ≥ SPLIT_MIN 分钟就断开。
 // 为什么要:她睡了回笼觉,手环会把回笼觉并进同一晚、整段重算(比如 02:33–06:52 变成 02:33–09:59),
 // 汇总里分不出哪段是夜里的。分期是一直在的,靠它拆回来。
-// 夜里起来上厕所醒十来分钟也要分开显示(那晚醒了 03:34–03:44 整 10 分钟,20 分钟的门槛没切)
-const SPLIT_MIN = 10;
+// 起来上个厕所醒 5 分钟也要分开(那晚醒了 03:34–03:44,20 分钟的门槛没切)。
+// 再低就会把翻身、迷糊一两分钟也切开(同一晚 04:47–04:50 醒了 3 分钟,不该切)
+const SPLIT_MIN = 5;
 const bjHour = (ms) => new Date(ms + BJ).getUTCHours();
 const ASLEEP = new Set([2, 3, 4]);
 export function sleepParts(s, stages) {
